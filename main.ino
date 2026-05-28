@@ -267,7 +267,7 @@ bool fetchAndCacheWeather()
     if (String(WEATHER_API_KEY) == "YOUR_API_KEY_HERE")
         return false;
 
-    String url = String("http://api.openweathermap.org/data/2.5/weather?q=YOUR_LOCATION,PK&units=metric&appid=") + WEATHER_API_KEY; // Set your Location
+    String url = String("http://api.openweathermap.org/data/2.5/weather?q=YOUR_LOCATION,COUNTRY_CODE&units=metric&appid=") + WEATHER_API_KEY; // Set your Location
 
     HTTPClient http;
     if (!http.begin(url))
