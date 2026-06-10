@@ -11,6 +11,9 @@
 #include "esp_sleep.h"
 #include "FS.h"
 #include "SD_MMC.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 /* ================= ESP32-CAM SAFE PIN MAP ================= */
 // OLED (I2C)
@@ -51,6 +54,29 @@ bool sdCardPresent = false;
 bool adjustingBrightness = false;
 unsigned long lastHomeRefresh = 0;
 
+const uint8_t BUTTON_EVENT_UP = 1 << 0;
+const uint8_t BUTTON_EVENT_DOWN = 1 << 1;
+const uint8_t BUTTON_EVENT_SELECT = 1 << 2;
+const uint32_t BUTTON_DEBOUNCE_MS = 35;
+
+typedef struct
+{
+    uint8_t pin;
+    uint8_t eventBit;
+    bool stableLevel;
+    bool lastRead;
+    uint32_t lastChangeMs;
+} ButtonDebounceState;
+
+ButtonDebounceState buttonStates[] = {
+    {BTN_UP, BUTTON_EVENT_UP, HIGH, HIGH, 0},
+    {BTN_DOWN, BUTTON_EVENT_DOWN, HIGH, HIGH, 0},
+    {BTN_SELECT, BUTTON_EVENT_SELECT, HIGH, HIGH, 0}};
+
+volatile uint8_t buttonEventFlags = 0;
+SemaphoreHandle_t buttonEventMutex = NULL;
+TaskHandle_t buttonTaskHandle = NULL;
+
 // Stopwatch state
 bool stopwatchRunning = false;
 unsigned long stopwatchBaseMillis = 0;  // millis() at last start
@@ -67,6 +93,76 @@ int currentScreen = SCREEN_HOME;
 // Photo counter
 int photoCounter = 0;
 const char *photoFolder = "/photos";
+
+void IRAM_ATTR onButtonPinChange()
+{
+    if (buttonTaskHandle != NULL)
+    {
+        BaseType_t higherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(buttonTaskHandle, &higherPriorityTaskWoken);
+        if (higherPriorityTaskWoken == pdTRUE)
+        {
+            portYIELD_FROM_ISR();
+        }
+    }
+}
+
+void queueButtonEvent(uint8_t eventBit)
+{
+    if (buttonEventMutex != NULL && xSemaphoreTake(buttonEventMutex, portMAX_DELAY) == pdTRUE)
+    {
+        buttonEventFlags |= eventBit;
+        xSemaphoreGive(buttonEventMutex);
+    }
+}
+
+uint8_t popButtonEvents()
+{
+    uint8_t events = 0;
+    if (buttonEventMutex != NULL && xSemaphoreTake(buttonEventMutex, portMAX_DELAY) == pdTRUE)
+    {
+        events = buttonEventFlags;
+        buttonEventFlags = 0;
+        xSemaphoreGive(buttonEventMutex);
+    }
+    return events;
+}
+
+void buttonInputTask(void *parameter)
+{
+    for (size_t i = 0; i < sizeof(buttonStates) / sizeof(buttonStates[0]); i++)
+    {
+        bool readLevel = digitalRead(buttonStates[i].pin);
+        buttonStates[i].stableLevel = readLevel;
+        buttonStates[i].lastRead = readLevel;
+        buttonStates[i].lastChangeMs = millis();
+    }
+
+    while (true)
+    {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+
+        uint32_t now = millis();
+        for (size_t i = 0; i < sizeof(buttonStates) / sizeof(buttonStates[0]); i++)
+        {
+            bool readLevel = digitalRead(buttonStates[i].pin);
+            if (readLevel != buttonStates[i].lastRead)
+            {
+                buttonStates[i].lastRead = readLevel;
+                buttonStates[i].lastChangeMs = now;
+            }
+
+            if ((now - buttonStates[i].lastChangeMs) >= BUTTON_DEBOUNCE_MS && readLevel != buttonStates[i].stableLevel)
+            {
+                buttonStates[i].stableLevel = readLevel;
+                if (readLevel == LOW)
+                {
+                    queueButtonEvent(buttonStates[i].eventBit);
+                }
+            }
+        }
+    }
+}
 
 // Timezone: GMT+0 (Set your Timezone offset)
 const long GMT_OFFSET_SEC = 0 * 3600; // Change 0 to your GMT+ offset
@@ -973,6 +1069,12 @@ void setup()
     // Connect WiFi
     connectWiFi();
 
+    buttonEventMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(buttonInputTask, "ButtonInputTask", 4096, NULL, 2, &buttonTaskHandle, 0);
+    attachInterrupt(digitalPinToInterrupt(BTN_UP), onButtonPinChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(BTN_DOWN), onButtonPinChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(BTN_SELECT), onButtonPinChange, CHANGE);
+
     showHome();
     lastHomeRefresh = millis();
     lastInteraction = millis();
@@ -982,9 +1084,10 @@ void setup()
 void loop()
 {
     server.handleClient();
+    uint8_t buttonEvents = popButtonEvents();
 
     // Check if screen should wake up (button press)
-    if (!screenOn && (!digitalRead(BTN_UP) || !digitalRead(BTN_DOWN) || !digitalRead(BTN_SELECT)))
+    if (!screenOn && buttonEvents != 0)
     {
         screenOn = true;
         adjustingBrightness = false;
@@ -992,7 +1095,7 @@ void loop()
         showHome();
         lastHomeRefresh = millis();
         lastInteraction = millis();
-        delay(200); // Debounce
+        return;
     }
 
     if (screenOn)
@@ -1014,7 +1117,7 @@ void loop()
         }
 
         // Button UP
-        if (!digitalRead(BTN_UP))
+        if (buttonEvents & BUTTON_EVENT_UP)
         {
             haptic();
             if (adjustingBrightness)
@@ -1033,12 +1136,11 @@ void loop()
                 menuIndex = (menuIndex - 1 + MENU_COUNT) % MENU_COUNT;
                 showMenu();
             }
-            delay(250);
             lastInteraction = millis();
         }
 
         // Button DOWN
-        if (!digitalRead(BTN_DOWN))
+        if (buttonEvents & BUTTON_EVENT_DOWN)
         {
             haptic();
             if (adjustingBrightness)
@@ -1061,12 +1163,11 @@ void loop()
                 menuIndex = (menuIndex + 1) % MENU_COUNT;
                 showMenu();
             }
-            delay(250);
             lastInteraction = millis();
         }
 
         // Button SELECT
-        if (!digitalRead(BTN_SELECT))
+        if (buttonEvents & BUTTON_EVENT_SELECT)
         {
             haptic();
             if (adjustingBrightness)
